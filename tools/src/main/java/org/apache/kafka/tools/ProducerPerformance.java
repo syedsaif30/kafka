@@ -17,6 +17,7 @@
 package org.apache.kafka.tools;
 
 import static net.sourceforge.argparse4j.impl.Arguments.store;
+import static net.sourceforge.argparse4j.impl.Arguments.storeFalse;
 import static net.sourceforge.argparse4j.impl.Arguments.storeTrue;
 
 import java.io.IOException;
@@ -68,6 +69,7 @@ public class ProducerPerformance {
             String transactionalId = res.getString("transactionalId");
             boolean shouldPrintMetrics = res.getBoolean("printMetrics");
             long transactionDurationMs = res.getLong("transactionDurationMs");
+            boolean sendKey = res.getBoolean("sendKey");
             boolean transactionsEnabled =  0 < transactionDurationMs;
 
             // since default value gets printed with the help text, we are escaping \n there and replacing it with correct value here.
@@ -109,7 +111,13 @@ public class ProducerPerformance {
                     transactionStartTime = System.currentTimeMillis();
                 }
 
-                record = new ProducerRecord<>(topicName, payload);
+                byte[] key = null;
+                if(sendKey) {
+                    String stringKey = "key" + i;
+                    key = stringKey.getBytes(StandardCharsets.UTF_8);
+                }
+
+                record = new ProducerRecord<>(topicName, key, payload);
 
                 long sendStartMs = System.currentTimeMillis();
                 Callback cb = stats.nextCompletion(sendStartMs, payload.length, stats);
@@ -324,6 +332,12 @@ public class ProducerPerformance {
                .setDefault(0L)
                .help("The max age of each transaction. The commitTransaction will be called after this time has elapsed. Transactions are only enabled if this value is positive.");
 
+        parser.addArgument("--send-key")
+            .action(storeTrue())
+            .type(Boolean.class)
+            .metavar("SEND-KEY")
+            .dest("sendKey")
+            .help("Generate a random key for the message");
 
         return parser;
     }
