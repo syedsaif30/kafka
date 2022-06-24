@@ -17,7 +17,6 @@
 package org.apache.kafka.tools;
 
 import static net.sourceforge.argparse4j.impl.Arguments.store;
-import static net.sourceforge.argparse4j.impl.Arguments.storeFalse;
 import static net.sourceforge.argparse4j.impl.Arguments.storeTrue;
 
 import java.io.IOException;
