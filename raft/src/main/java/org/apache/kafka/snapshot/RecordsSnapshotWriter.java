@@ -30,6 +30,7 @@ import org.apache.kafka.common.record.ControlRecordUtils;
 
 import java.util.Optional;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.function.Supplier;
 
 final public class RecordsSnapshotWriter<T> implements SnapshotWriter<T> {
@@ -52,7 +53,7 @@ final public class RecordsSnapshotWriter<T> implements SnapshotWriter<T> {
         this.lastContainedLogTimestamp = lastContainedLogTimestamp;
 
         this.accumulator = new BatchAccumulator<>(
-            snapshot.snapshotId().epoch,
+            snapshot.snapshotId().epoch(),
             0,
             Integer.MAX_VALUE,
             maxBatchSize,
@@ -78,9 +79,9 @@ final public class RecordsSnapshotWriter<T> implements SnapshotWriter<T> {
         }
 
         SnapshotHeaderRecord headerRecord = new SnapshotHeaderRecord()
-            .setVersion(ControlRecordUtils.SNAPSHOT_HEADER_HIGHEST_VERSION)
+            .setVersion(ControlRecordUtils.SNAPSHOT_HEADER_CURRENT_VERSION)
             .setLastContainedLogTimestamp(lastContainedLogTimestamp);
-        accumulator.appendSnapshotHeaderMessage(headerRecord, time.milliseconds());
+        accumulator.appendSnapshotHeaderRecord(headerRecord, time.milliseconds());
         accumulator.forceDrain();
     }
 
@@ -91,8 +92,8 @@ final public class RecordsSnapshotWriter<T> implements SnapshotWriter<T> {
      */
     private void finalizeSnapshotWithFooter() {
         SnapshotFooterRecord footerRecord = new SnapshotFooterRecord()
-            .setVersion(ControlRecordUtils.SNAPSHOT_FOOTER_HIGHEST_VERSION);
-        accumulator.appendSnapshotFooterMessage(footerRecord, time.milliseconds());
+            .setVersion(ControlRecordUtils.SNAPSHOT_FOOTER_CURRENT_VERSION);
+        accumulator.appendSnapshotFooterRecord(footerRecord, time.milliseconds());
         accumulator.forceDrain();
     }
 
@@ -118,19 +119,39 @@ final public class RecordsSnapshotWriter<T> implements SnapshotWriter<T> {
         CompressionType compressionType,
         RecordSerde<T> serde
     ) {
-        return supplier.get().map(snapshot -> {
-            RecordsSnapshotWriter<T> writer = new RecordsSnapshotWriter<>(
-                    snapshot,
-                    maxBatchSize,
-                    memoryPool,
-                    snapshotTime,
-                    lastContainedLogTimestamp,
-                    compressionType,
-                    serde);
-            writer.initializeSnapshotWithHeader();
+        return supplier.get().map(writer ->
+            createWithHeader(
+                writer,
+                maxBatchSize,
+                memoryPool,
+                snapshotTime,
+                lastContainedLogTimestamp,
+                compressionType,
+                serde
+            )
+        );
+    }
 
-            return writer;
-        });
+    public static <T> RecordsSnapshotWriter<T> createWithHeader(
+        RawSnapshotWriter rawSnapshotWriter,
+        int maxBatchSize,
+        MemoryPool memoryPool,
+        Time snapshotTime,
+        long lastContainedLogTimestamp,
+        CompressionType compressionType,
+        RecordSerde<T> serde
+    ) {
+        RecordsSnapshotWriter<T> writer = new RecordsSnapshotWriter<>(
+            rawSnapshotWriter,
+            maxBatchSize,
+            memoryPool,
+            snapshotTime,
+            lastContainedLogTimestamp,
+            compressionType,
+            serde
+        );
+        writer.initializeSnapshotWithHeader();
+        return writer;
     }
 
     @Override
@@ -140,12 +161,12 @@ final public class RecordsSnapshotWriter<T> implements SnapshotWriter<T> {
 
     @Override
     public long lastContainedLogOffset() {
-        return snapshot.snapshotId().offset - 1;
+        return snapshot.snapshotId().offset() - 1;
     }
 
     @Override
     public int lastContainedLogEpoch() {
-        return snapshot.snapshotId().epoch;
+        return snapshot.snapshotId().epoch();
     }
 
     @Override
@@ -164,7 +185,7 @@ final public class RecordsSnapshotWriter<T> implements SnapshotWriter<T> {
             throw new IllegalStateException(message);
         }
 
-        accumulator.append(snapshot.snapshotId().epoch, records);
+        accumulator.append(snapshot.snapshotId().epoch(), records, OptionalLong.empty(), false);
 
         if (accumulator.needsDrain(time.milliseconds())) {
             appendBatches(accumulator.drain());
@@ -172,11 +193,12 @@ final public class RecordsSnapshotWriter<T> implements SnapshotWriter<T> {
     }
 
     @Override
-    public void freeze() {
+    public long freeze() {
         finalizeSnapshotWithFooter();
         appendBatches(accumulator.drain());
         snapshot.freeze();
         accumulator.close();
+        return snapshot.sizeInBytes();
     }
 
     @Override

@@ -165,7 +165,8 @@ public class MeteredSessionStore<K, V>
                     record.withKey(SessionKeySchema.from(record.key(), serdes.keyDeserializer(), serdes.topic()))
                         .withValue(new Change<>(
                             record.value().newValue != null ? serdes.valueFrom(record.value().newValue) : null,
-                            record.value().oldValue != null ? serdes.valueFrom(record.value().oldValue) : null
+                            record.value().oldValue != null ? serdes.valueFrom(record.value().oldValue) : null,
+                            record.value().isLatest
                         ))
                 ),
                 sendOldValues);
@@ -344,6 +345,18 @@ public class MeteredSessionStore<K, V>
             serdes::keyFrom,
             serdes::valueFrom,
             time);
+    }
+
+    @Override
+    public KeyValueIterator<Windowed<K>, V> findSessions(final long earliestSessionEndTime,
+                                                         final long latestSessionEndTime) {
+        return new MeteredWindowedKeyValueIterator<>(
+                wrapped().findSessions(earliestSessionEndTime, latestSessionEndTime),
+                fetchSensor,
+                streamsMetrics,
+                serdes::keyFrom,
+                serdes::valueFrom,
+                time);
     }
 
     @Override

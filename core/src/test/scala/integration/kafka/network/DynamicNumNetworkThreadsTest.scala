@@ -15,7 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package integration.kafka.network
+package kafka.network
 
 import kafka.server.{BaseRequestTest, Defaults, KafkaConfig}
 import kafka.utils.TestUtils
@@ -38,6 +38,7 @@ class DynamicNumNetworkThreadsTest extends BaseRequestTest {
     properties.put(KafkaConfig.ListenersProp, s"$internal://localhost:0, $external://localhost:0")
     properties.put(KafkaConfig.ListenerSecurityProtocolMapProp, s"$internal:PLAINTEXT, $external:PLAINTEXT")
     properties.put(s"listener.name.${internal.toLowerCase}.${KafkaConfig.NumNetworkThreadsProp}", "2")
+    properties.put(KafkaConfig.NumNetworkThreadsProp, Defaults.NumNetworkThreads.toString)
   }
 
   @BeforeEach

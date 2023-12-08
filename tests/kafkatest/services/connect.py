@@ -97,7 +97,7 @@ class ConnectServiceBase(KafkaPathResolverMixin, Service):
         create the configuration.
         """
         self.config_template_func = config_template_func
-        self.connector_config_templates = connector_config_templates
+        self.connector_config_templates = connector_config_templates if connector_config_templates else []
 
     def set_external_configs(self, external_config_template_func):
         """
@@ -120,10 +120,10 @@ class ConnectServiceBase(KafkaPathResolverMixin, Service):
             self.logger.debug("REST resources are not loaded yet")
             return False
 
-    def start(self, mode=None):
+    def start(self, mode=None, **kwargs):
         if mode:
             self.startup_mode = mode
-        super(ConnectServiceBase, self).start()
+        super(ConnectServiceBase, self).start(**kwargs)
 
     def start_and_return_immediately(self, node, worker_type, remote_connector_configs):
         cmd = self.start_cmd(node, remote_connector_configs)
@@ -152,14 +152,17 @@ class ConnectServiceBase(KafkaPathResolverMixin, Service):
                                err_msg="Never saw message indicating Kafka Connect joined group on node: " +
                                        "%s in condition mode: %s" % (str(node.account), self.startup_mode))
 
-    def stop_node(self, node, clean_shutdown=True):
-        self.logger.info((clean_shutdown and "Cleanly" or "Forcibly") + " stopping Kafka Connect on " + str(node.account))
+    def stop_node(self, node, clean_shutdown=True, await_shutdown=None):
+        if await_shutdown is None:
+            await_shutdown = clean_shutdown
+        self.logger.info((clean_shutdown and "Cleanly" or "Forcibly") + " stopping Kafka Connect on " + str(node.account) \
+                         + " and " + ("" if await_shutdown else "not ") + "awaiting shutdown")
         pids = self.pids(node)
         sig = signal.SIGTERM if clean_shutdown else signal.SIGKILL
 
         for pid in pids:
             node.account.signal(pid, sig, allow_fail=True)
-        if clean_shutdown:
+        if await_shutdown:
             for pid in pids:
                 wait_until(lambda: not node.account.alive(pid), timeout_sec=self.startup_timeout_sec, err_msg="Kafka Connect process on " + str(
                     node.account) + " took too long to exit")
@@ -238,6 +241,21 @@ class ConnectServiceBase(KafkaPathResolverMixin, Service):
     def validate_config(self, connector_type, validate_request, node=None):
         return self._rest('/connector-plugins/' + connector_type + '/config/validate', validate_request, node=node, method="PUT")
 
+    def get_logger(self, node, logger):
+        return self._rest('/admin/loggers/' + logger, node=node)
+
+    def get_all_loggers(self, node):
+        return self._rest('/admin/loggers', node=node)
+
+    def set_logger(self, node, logger, level, scope=None):
+        set_request = {
+            'level': level
+        }
+        path = '/admin/loggers/' + logger
+        if scope is not None:
+            path += '?scope=' + scope
+        return self._rest(path, set_request, node, "PUT")
+
     def _rest(self, path, body=None, node=None, method="GET"):
         if node is None:
             node = random.choice(self.nodes)
@@ -282,26 +300,31 @@ class ConnectServiceBase(KafkaPathResolverMixin, Service):
             env_opts = "\"%s %s\"" % (env_opts.strip('\"'), value)
         self.environment[envvar] = env_opts
 
-    def append_filestream_connectors_to_classpath(self):
+    def maybe_append_filestream_connectors_to_classpath(self):
         if self.include_filestream_connectors:
-            cwd = os.getcwd()
-            self.logger.info("Including filestream connectors when starting Connect. "
-                             "Looking for jar locally in: %s" % cwd)
-            relative_path = "/connect/file/build/libs/"
-            local_dir = cwd + relative_path
-            lib_dir = self.path.home() + relative_path
-            for pwd, dirs, files in os.walk(local_dir):
-                for file in files:
-                    if file.startswith("connect-file") and file.endswith(".jar"):
-                        # Use the expected directory on the node instead of the path in the driver node
-                        file_path = lib_dir + file
-                        self.logger.debug("Appending %s to Connect worker's CLASSPATH" % file_path)
-                        return "export CLASSPATH=${CLASSPATH}:%s; " % file_path
-            self.logger.info("Jar with filestream connectors was not found under %s" % lib_dir)
+            return self.append_module_to_classpath("file")
         else:
             self.logger.info("Starting Connect without filestream connectors in the CLASSPATH")
+        return ""
 
-        return None
+    def append_test_plugins_to_classpath(self):
+        return self.append_module_to_classpath("test-plugins")
+
+    def append_module_to_classpath(self, module):
+        cwd = os.getcwd()
+        relative_path = "/connect/" + module + "/build/libs/"
+        local_dir = cwd + relative_path
+        lib_dir = self.path.home() + relative_path
+        for pwd, dirs, files in os.walk(local_dir):
+            for file in files:
+                if file.endswith(".jar"):
+                    # Use the expected directory on the node instead of the path in the driver node
+                    file_path = lib_dir + file
+                    self.logger.info("Appending %s to Connect worker's CLASSPATH" % file_path)
+                    return "export CLASSPATH=${CLASSPATH}:%s; " % file_path
+
+        self.logger.info("Jar not found within %s" % local_dir)
+        return ""
 
 
 class ConnectStandaloneService(ConnectServiceBase):
@@ -324,8 +347,8 @@ class ConnectStandaloneService(ConnectServiceBase):
 
         cmd += fix_opts_for_new_jvm(node)
         cmd += "export KAFKA_OPTS=\"%s %s\"; " % (heap_kafka_opts, other_kafka_opts)
-        classpath = self.append_filestream_connectors_to_classpath()
-        cmd += classpath if classpath else ""
+        cmd += self.append_test_plugins_to_classpath()
+        cmd += self.maybe_append_filestream_connectors_to_classpath()
 
         for envvar in self.environment:
             cmd += "export %s=%s; " % (envvar, str(self.environment[envvar]))
@@ -334,7 +357,7 @@ class ConnectStandaloneService(ConnectServiceBase):
         cmd += " & echo $! >&3 ) 1>> %s 2>> %s 3> %s" % (self.STDOUT_FILE, self.STDERR_FILE, self.PID_FILE)
         return cmd
 
-    def start_node(self, node):
+    def start_node(self, node, **kwargs):
         node.account.ssh("mkdir -p %s" % self.PERSISTENT_ROOT, allow_fail=False)
 
         self.security_config.setup_node(node)
@@ -359,7 +382,7 @@ class ConnectStandaloneService(ConnectServiceBase):
             # The default mode is to wait until the complete startup of the worker
             self.start_and_wait_to_start_listening(node, 'standalone', remote_connector_configs)
 
-        if len(self.pids(node)) == 0:
+        if not self.pids(node):
             raise RuntimeError("No process ids recorded")
 
 
@@ -385,13 +408,13 @@ class ConnectDistributedService(ConnectServiceBase):
         for envvar in self.environment:
             cmd += "export %s=%s; " % (envvar, str(self.environment[envvar]))
 
-        classpath = self.append_filestream_connectors_to_classpath()
-        cmd += classpath if classpath else ""
+        cmd += self.maybe_append_filestream_connectors_to_classpath()
+        cmd += self.append_test_plugins_to_classpath()
         cmd += "%s %s " % (self.path.script("connect-distributed.sh", node), self.CONFIG_FILE)
         cmd += " & echo $! >&3 ) 1>> %s 2>> %s 3> %s" % (self.STDOUT_FILE, self.STDERR_FILE, self.PID_FILE)
         return cmd
 
-    def start_node(self, node):
+    def start_node(self, node, **kwargs):
         node.account.ssh("mkdir -p %s" % self.PERSISTENT_ROOT, allow_fail=False)
 
         self.security_config.setup_node(node)
@@ -413,7 +436,7 @@ class ConnectDistributedService(ConnectServiceBase):
             # The default mode is to wait until the complete startup of the worker
             self.start_and_wait_to_join_group(node, 'distributed', '')
 
-        if len(self.pids(node)) == 0:
+        if not self.pids(node):
             raise RuntimeError("No process ids recorded")
 
 
@@ -464,13 +487,14 @@ class VerifiableSource(VerifiableConnector):
     Helper class for running a verifiable source connector on a Kafka Connect cluster and analyzing the output.
     """
 
-    def __init__(self, cc, name="verifiable-source", tasks=1, topic="verifiable", throughput=1000):
+    def __init__(self, cc, name="verifiable-source", tasks=1, topic="verifiable", throughput=1000, complete_records=False):
         self.cc = cc
         self.logger = self.cc.logger
         self.name = name
         self.tasks = tasks
         self.topic = topic
         self.throughput = throughput
+        self.complete_records = complete_records
 
     def committed_messages(self):
         return list(filter(lambda m: 'committed' in m and m['committed'], self.messages()))
@@ -485,7 +509,8 @@ class VerifiableSource(VerifiableConnector):
             'connector.class': 'org.apache.kafka.connect.tools.VerifiableSourceConnector',
             'tasks.max': self.tasks,
             'topic': self.topic,
-            'throughput': self.throughput
+            'throughput': self.throughput,
+            'complete.record.data': self.complete_records
         })
 
 

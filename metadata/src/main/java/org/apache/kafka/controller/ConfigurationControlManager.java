@@ -22,11 +22,14 @@ import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.common.config.ConfigResource.Type;
 import org.apache.kafka.common.config.ConfigResource;
+import org.apache.kafka.common.config.types.Password;
 import org.apache.kafka.common.metadata.ConfigRecord;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.ApiError;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.metadata.KafkaConfigSchema;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
+import org.apache.kafka.server.mutable.BoundedList;
 import org.apache.kafka.server.policy.AlterConfigPolicy;
 import org.apache.kafka.server.policy.AlterConfigPolicy.RequestMetadata;
 import org.apache.kafka.timeline.SnapshotRegistry;
@@ -47,8 +50,8 @@ import java.util.Optional;
 import java.util.function.Consumer;
 
 import static org.apache.kafka.clients.admin.AlterConfigOp.OpType.APPEND;
-import static org.apache.kafka.common.metadata.MetadataRecordType.CONFIG_RECORD;
 import static org.apache.kafka.common.protocol.Errors.INVALID_CONFIG;
+import static org.apache.kafka.controller.QuorumController.MAX_RECORDS_PER_USER_OP;
 
 
 public class ConfigurationControlManager {
@@ -166,26 +169,43 @@ public class ConfigurationControlManager {
      * @return                  The result.
      */
     ControllerResult<Map<ConfigResource, ApiError>> incrementalAlterConfigs(
-            Map<ConfigResource, Map<String, Entry<OpType, String>>> configChanges,
-            boolean newlyCreatedResource) {
-        List<ApiMessageAndVersion> outputRecords = new ArrayList<>();
+        Map<ConfigResource, Map<String, Entry<OpType, String>>> configChanges,
+        boolean newlyCreatedResource
+    ) {
+        List<ApiMessageAndVersion> outputRecords =
+                BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);
         Map<ConfigResource, ApiError> outputResults = new HashMap<>();
         for (Entry<ConfigResource, Map<String, Entry<OpType, String>>> resourceEntry :
                 configChanges.entrySet()) {
-            incrementalAlterConfigResource(resourceEntry.getKey(),
+            ApiError apiError = incrementalAlterConfigResource(resourceEntry.getKey(),
                 resourceEntry.getValue(),
                 newlyCreatedResource,
-                outputRecords,
-                outputResults);
+                outputRecords);
+            outputResults.put(resourceEntry.getKey(), apiError);
         }
         return ControllerResult.atomicOf(outputRecords, outputResults);
     }
 
-    private void incrementalAlterConfigResource(ConfigResource configResource,
-                                                Map<String, Entry<OpType, String>> keysToOps,
-                                                boolean newlyCreatedResource,
-                                                List<ApiMessageAndVersion> outputRecords,
-                                                Map<ConfigResource, ApiError> outputResults) {
+    ControllerResult<ApiError> incrementalAlterConfig(
+        ConfigResource configResource,
+        Map<String, Entry<OpType, String>> keyToOps,
+        boolean newlyCreatedResource
+    ) {
+        List<ApiMessageAndVersion> outputRecords =
+                BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);
+        ApiError apiError = incrementalAlterConfigResource(configResource,
+            keyToOps,
+            newlyCreatedResource,
+            outputRecords);
+        return ControllerResult.atomicOf(outputRecords, apiError);
+    }
+
+    private ApiError incrementalAlterConfigResource(
+        ConfigResource configResource,
+        Map<String, Entry<OpType, String>> keysToOps,
+        boolean newlyCreatedResource,
+        List<ApiMessageAndVersion> outputRecords
+    ) {
         List<ApiMessageAndVersion> newRecords = new ArrayList<>();
         for (Entry<String, Entry<OpType, String>> keysToOpsEntry : keysToOps.entrySet()) {
             String key = keysToOpsEntry.getKey();
@@ -208,10 +228,9 @@ public class ConfigurationControlManager {
                 case APPEND:
                 case SUBTRACT:
                     if (!configSchema.isSplittable(configResource.type(), key)) {
-                        outputResults.put(configResource, new ApiError(
+                        return new ApiError(
                             INVALID_CONFIG, "Can't " + opType + " to " +
-                            "key " + key + " because its type is not LIST."));
-                        return;
+                            "key " + key + " because its type is not LIST.");
                     }
                     List<String> oldValueList = getParts(newValue, key, configResource);
                     if (opType == APPEND) {
@@ -228,49 +247,63 @@ public class ConfigurationControlManager {
                     newValue = String.join(",", oldValueList);
                     break;
             }
-            if (!Objects.equals(currentValue, newValue)) {
+            if (!Objects.equals(currentValue, newValue) || configResource.type().equals(Type.BROKER)) {
+                // KAFKA-14136 We need to generate records even if the value is unchanged to trigger reloads on the brokers
                 newRecords.add(new ApiMessageAndVersion(new ConfigRecord().
                     setResourceType(configResource.type().id()).
                     setResourceName(configResource.name()).
                     setName(key).
-                    setValue(newValue), CONFIG_RECORD.highestSupportedVersion()));
+                    setValue(newValue), (short) 0));
             }
         }
-        ApiError error = validateAlterConfig(configResource, newRecords, newlyCreatedResource);
+        ApiError error = validateAlterConfig(configResource, newRecords, Collections.emptyList(), newlyCreatedResource);
         if (error.isFailure()) {
-            outputResults.put(configResource, error);
-            return;
+            return error;
         }
         outputRecords.addAll(newRecords);
-        outputResults.put(configResource, ApiError.NONE);
+        return ApiError.NONE;
     }
 
     private ApiError validateAlterConfig(ConfigResource configResource,
-                                         List<ApiMessageAndVersion> newRecords,
+                                         List<ApiMessageAndVersion> recordsExplicitlyAltered,
+                                         List<ApiMessageAndVersion> recordsImplicitlyDeleted,
                                          boolean newlyCreatedResource) {
-        Map<String, String> newConfigs = new HashMap<>();
+        Map<String, String> allConfigs = new HashMap<>();
+        Map<String, String> alteredConfigsForAlterConfigPolicyCheck = new HashMap<>();
         TimelineHashMap<String, String> existingConfigs = configData.get(configResource);
-        if (existingConfigs != null) newConfigs.putAll(existingConfigs);
-        for (ApiMessageAndVersion newRecord : newRecords) {
+        if (existingConfigs != null) allConfigs.putAll(existingConfigs);
+        for (ApiMessageAndVersion newRecord : recordsExplicitlyAltered) {
             ConfigRecord configRecord = (ConfigRecord) newRecord.message();
             if (configRecord.value() == null) {
-                newConfigs.remove(configRecord.name());
+                allConfigs.remove(configRecord.name());
             } else {
-                newConfigs.put(configRecord.name(), configRecord.value());
+                allConfigs.put(configRecord.name(), configRecord.value());
             }
+            alteredConfigsForAlterConfigPolicyCheck.put(configRecord.name(), configRecord.value());
+        }
+        for (ApiMessageAndVersion recordImplicitlyDeleted : recordsImplicitlyDeleted) {
+            ConfigRecord configRecord = (ConfigRecord) recordImplicitlyDeleted.message();
+            allConfigs.remove(configRecord.name());
+            // As per KAFKA-14195, do not include implicit deletions caused by using the legacy AlterConfigs API
+            // in the list passed to the policy in order to maintain backwards compatibility
         }
         try {
-            validator.validate(configResource, newConfigs);
+            validator.validate(configResource, allConfigs);
             if (!newlyCreatedResource) {
                 existenceChecker.accept(configResource);
             }
             if (alterConfigPolicy.isPresent()) {
-                alterConfigPolicy.get().validate(new RequestMetadata(configResource, newConfigs));
+                alterConfigPolicy.get().validate(new RequestMetadata(configResource, alteredConfigsForAlterConfigPolicyCheck));
             }
         } catch (ConfigException e) {
             return new ApiError(INVALID_CONFIG, e.getMessage());
         } catch (Throwable e) {
-            return ApiError.fromThrowable(e);
+            // return the corresponding API error, but emit the stack trace first if it is an unknown server error
+            ApiError apiError = ApiError.fromThrowable(e);
+            if (apiError.error() == Errors.UNKNOWN_SERVER_ERROR) {
+                log.error("Unknown server error validating Alter Configs", e);
+            }
+            return apiError;
         }
         return ApiError.NONE;
     }
@@ -288,7 +321,8 @@ public class ConfigurationControlManager {
         Map<ConfigResource, Map<String, String>> newConfigs,
         boolean newlyCreatedResource
     ) {
-        List<ApiMessageAndVersion> outputRecords = new ArrayList<>();
+        List<ApiMessageAndVersion> outputRecords =
+                BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);
         Map<ConfigResource, ApiError> outputResults = new HashMap<>();
         for (Entry<ConfigResource, Map<String, String>> resourceEntry :
             newConfigs.entrySet()) {
@@ -306,7 +340,7 @@ public class ConfigurationControlManager {
                                            boolean newlyCreatedResource,
                                            List<ApiMessageAndVersion> outputRecords,
                                            Map<ConfigResource, ApiError> outputResults) {
-        List<ApiMessageAndVersion> newRecords = new ArrayList<>();
+        List<ApiMessageAndVersion> recordsExplicitlyAltered = new ArrayList<>();
         Map<String, String> currentConfigs = configData.get(configResource);
         if (currentConfigs == null) {
             currentConfigs = Collections.emptyMap();
@@ -315,29 +349,32 @@ public class ConfigurationControlManager {
             String key = entry.getKey();
             String newValue = entry.getValue();
             String currentValue = currentConfigs.get(key);
-            if (!Objects.equals(newValue, currentValue)) {
-                newRecords.add(new ApiMessageAndVersion(new ConfigRecord().
+            if (!Objects.equals(currentValue, newValue) || configResource.type().equals(Type.BROKER)) {
+                // KAFKA-14136 We need to generate records even if the value is unchanged to trigger reloads on the brokers
+                recordsExplicitlyAltered.add(new ApiMessageAndVersion(new ConfigRecord().
                     setResourceType(configResource.type().id()).
                     setResourceName(configResource.name()).
                     setName(key).
-                    setValue(newValue), CONFIG_RECORD.highestSupportedVersion()));
+                    setValue(newValue), (short) 0));
             }
         }
+        List<ApiMessageAndVersion> recordsImplicitlyDeleted = new ArrayList<>();
         for (String key : currentConfigs.keySet()) {
             if (!newConfigs.containsKey(key)) {
-                newRecords.add(new ApiMessageAndVersion(new ConfigRecord().
+                recordsImplicitlyDeleted.add(new ApiMessageAndVersion(new ConfigRecord().
                     setResourceType(configResource.type().id()).
                     setResourceName(configResource.name()).
                     setName(key).
-                    setValue(null), CONFIG_RECORD.highestSupportedVersion()));
+                    setValue(null), (short) 0));
             }
         }
-        ApiError error = validateAlterConfig(configResource, newRecords, newlyCreatedResource);
+        ApiError error = validateAlterConfig(configResource, recordsExplicitlyAltered, recordsImplicitlyDeleted, newlyCreatedResource);
         if (error.isFailure()) {
             outputResults.put(configResource, error);
             return;
         }
-        outputRecords.addAll(newRecords);
+        outputRecords.addAll(recordsExplicitlyAltered);
+        outputRecords.addAll(recordsImplicitlyDeleted);
         outputResults.put(configResource, ApiError.NONE);
     }
 
@@ -379,7 +416,13 @@ public class ConfigurationControlManager {
         if (configs.isEmpty()) {
             configData.remove(configResource);
         }
-        log.info("{}: set configuration {} to {}", configResource, record.name(), record.value());
+        if (configSchema.isSensitive(record)) {
+            log.info("Replayed ConfigRecord for {} which set configuration {} to {}",
+                    configResource, record.name(), Password.HIDDEN);
+        } else {
+            log.info("Replayed ConfigRecord for {} which set configuration {} to {}",
+                    configResource, record.name(), record.value());
+        }
     }
 
     // VisibleForTesting
@@ -390,6 +433,25 @@ public class ConfigurationControlManager {
         } else {
             return Collections.unmodifiableMap(new HashMap<>(map));
         }
+    }
+
+    /**
+     * Get the config value for the give topic and give config key.
+     * If the config value is not found, return null.
+     *
+     * @param topicName            The topic name for the config.
+     * @param configKey            The key for the config.
+     */
+    String getTopicConfig(String topicName, String configKey) throws NoSuchElementException {
+        Map<String, String> map = configData.get(new ConfigResource(Type.TOPIC, topicName));
+        if (map == null || !map.containsKey(configKey)) {
+            Map<String, ConfigEntry> effectiveConfigMap = computeEffectiveTopicConfigs(Collections.emptyMap());
+            if (!effectiveConfigMap.containsKey(configKey)) {
+                return null;
+            }
+            return effectiveConfigMap.get(configKey).value();
+        }
+        return map.get(configKey);
     }
 
     public Map<ConfigResource, ResultOrError<Map<String, String>>> describeConfigs(
@@ -450,40 +512,5 @@ public class ConfigurationControlManager {
     Map<String, String> currentControllerConfig() {
         Map<String, String> result = configData.get(currentController);
         return (result == null) ? Collections.emptyMap() : result;
-    }
-
-    class ConfigurationControlIterator implements Iterator<List<ApiMessageAndVersion>> {
-        private final long epoch;
-        private final Iterator<Entry<ConfigResource, TimelineHashMap<String, String>>> iterator;
-
-        ConfigurationControlIterator(long epoch) {
-            this.epoch = epoch;
-            this.iterator = configData.entrySet(epoch).iterator();
-        }
-
-        @Override
-        public boolean hasNext() {
-            return iterator.hasNext();
-        }
-
-        @Override
-        public List<ApiMessageAndVersion> next() {
-            if (!hasNext()) throw new NoSuchElementException();
-            List<ApiMessageAndVersion> records = new ArrayList<>();
-            Entry<ConfigResource, TimelineHashMap<String, String>> entry = iterator.next();
-            ConfigResource resource = entry.getKey();
-            for (Entry<String, String> configEntry : entry.getValue().entrySet(epoch)) {
-                records.add(new ApiMessageAndVersion(new ConfigRecord().
-                    setResourceName(resource.name()).
-                    setResourceType(resource.type().id()).
-                    setName(configEntry.getKey()).
-                    setValue(configEntry.getValue()), CONFIG_RECORD.highestSupportedVersion()));
-            }
-            return records;
-        }
-    }
-
-    ConfigurationControlIterator iterator(long epoch) {
-        return new ConfigurationControlIterator(epoch);
     }
 }

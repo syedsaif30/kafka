@@ -30,8 +30,10 @@ import scala.collection.{Seq, mutable}
 import scala.jdk.CollectionConverters._
 import java.util.Properties
 import kafka.utils.TestUtils.{createAdminClient, resource}
+import org.apache.kafka.common.acl.AccessControlEntry
 import org.apache.kafka.common.{KafkaException, Uuid}
 import org.apache.kafka.common.network.ListenerName
+import org.apache.kafka.common.resource.ResourcePattern
 import org.apache.kafka.common.security.scram.ScramCredential
 import org.apache.kafka.common.utils.Time
 import org.apache.kafka.controller.ControllerRequestContextUtil.ANONYMOUS_CONTEXT
@@ -40,7 +42,7 @@ import org.apache.kafka.controller.ControllerRequestContextUtil.ANONYMOUS_CONTEX
  * A test harness that brings up some number of broker nodes
  */
 abstract class KafkaServerTestHarness extends QuorumTestHarness {
-  var instanceConfigs: Seq[KafkaConfig] = null
+  var instanceConfigs: Seq[KafkaConfig] = _
 
   private val _brokers = new mutable.ArrayBuffer[KafkaBroker]
 
@@ -58,7 +60,7 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
     _brokers.asInstanceOf[mutable.Buffer[KafkaServer]]
   }
 
-  var alive: Array[Boolean] = null
+  var alive: Array[Boolean] = _
 
   /**
    * Implementations must override this method to return a set of KafkaConfigs. This method will be invoked for every
@@ -77,7 +79,7 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
    *
    * The default implementation of this method is a no-op.
    */
-  def configureSecurityBeforeServersStart(): Unit = {}
+  def configureSecurityBeforeServersStart(testInfo: TestInfo): Unit = {}
 
   /**
    * Override this in case Tokens or security credentials needs to be created after `servers` are started.
@@ -114,7 +116,7 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
       throw new KafkaException("Must supply at least one server config.")
 
     // default implementation is a no-op, it is overridden by subclasses if required
-    configureSecurityBeforeServersStart()
+    configureSecurityBeforeServersStart(testInfo)
 
     createBrokers(startup = true)
 
@@ -150,7 +152,7 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
   ): Unit = {
     if (isKRaftTest()) {
       resource(createAdminClient(brokers, listenerName, adminClientConfig)) { admin =>
-        TestUtils.createOffsetsTopicWithAdmin(admin, brokers)
+        TestUtils.createOffsetsTopicWithAdmin(admin, brokers, controllerServers)
       }
     } else {
       TestUtils.createOffsetsTopic(zkClient, servers)
@@ -176,6 +178,7 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
           admin = admin,
           topic = topic,
           brokers = brokers,
+          controllers = controllerServers,
           numPartitions = numPartitions,
           replicationFactor = replicationFactor,
           topicConfig = topicConfig
@@ -209,7 +212,8 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
           admin = admin,
           topic = topic,
           replicaAssignment = partitionReplicaAssignment,
-          brokers = brokers
+          brokers = brokers,
+          controllers = controllerServers
         )
       }
     } else {
@@ -230,11 +234,20 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
         TestUtils.deleteTopicWithAdmin(
           admin = admin,
           topic = topic,
-          brokers = brokers)
+          brokers = aliveBrokers,
+          controllers = controllerServers)
       }
     } else {
       adminZkClient.deleteTopic(topic)
     }
+  }
+
+  def addAndVerifyAcls(acls: Set[AccessControlEntry], resource: ResourcePattern): Unit = {
+    TestUtils.addAndVerifyAcls(brokers, acls, resource, controllerServers)
+  }
+
+  def removeAndVerifyAcls(acls: Set[AccessControlEntry], resource: ResourcePattern): Unit = {
+    TestUtils.removeAndVerifyAcls(brokers, acls, resource, controllerServers)
   }
 
   /**
@@ -248,10 +261,17 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
   }
 
   def killBroker(index: Int): Unit = {
-    if(alive(index)) {
+    if (alive(index)) {
       _brokers(index).shutdown()
       _brokers(index).awaitShutdown()
       alive(index) = false
+    }
+  }
+
+  def startBroker(index: Int): Unit = {
+    if (!alive(index)) {
+      _brokers(index).startup()
+      alive(index) = true
     }
   }
 
@@ -347,7 +367,8 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
         config,
         time = brokerTime(config.brokerId),
         threadNamePrefix = None,
-        startup = false
+        startup = false,
+        enableZkApiForwarding = isZkMigrationTest() || (config.migrationEnabled && config.interBrokerProtocolVersion.isApiForwardingEnabled)
       )
     }
   }

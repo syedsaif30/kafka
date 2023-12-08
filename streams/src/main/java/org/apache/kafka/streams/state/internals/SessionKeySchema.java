@@ -35,7 +35,7 @@ public class SessionKeySchema implements SegmentedBytesStore.KeySchema {
     private static final byte[] MIN_SUFFIX = new byte[SUFFIX_SIZE];
 
     public static int keyByteLength(final Bytes key) {
-        return key.get().length + 2 * TIMESTAMP_SIZE;
+        return (key == null ? 0 : key.get().length) + 2 * TIMESTAMP_SIZE;
     }
 
     @Override
@@ -190,7 +190,7 @@ public class SessionKeySchema implements SegmentedBytesStore.KeySchema {
         // since the session window length can vary, we define the search boundary as:
         // lower: [0, ESET]
         // upper: [LSST, INF]
-        // and by puting the end time first and then the start time, the serialized search boundary
+        // and by putting the end time first and then the start time, the serialized search boundary
         // is: [(ESET-0), (INF-LSST)]
         buf.put(key.get());
         buf.putLong(endTime);

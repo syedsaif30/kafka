@@ -53,7 +53,7 @@ class LeaderEpochIntegrationTest extends QuorumTestHarness with Logging {
   val t2p0 = new TopicPartition(topic2, 0)
   val t2p2 = new TopicPartition(topic2, 2)
   val tp = t1p0
-  var producer: KafkaProducer[Array[Byte], Array[Byte]] = null
+  var producer: KafkaProducer[Array[Byte], Array[Byte]] = _
 
   @AfterEach
   override def tearDown(): Unit = {
@@ -246,12 +246,11 @@ class LeaderEpochIntegrationTest extends QuorumTestHarness with Logging {
       val tp = new TopicPartition(topic, 0)
       val leo = broker.getLogManager.getLog(tp).get.logEndOffset
       result = result && leo > 0 && brokers.forall { broker =>
-        broker.getLogManager.getLog(tp).get.logSegments.iterator.forall { segment =>
+        broker.getLogManager.getLog(tp).get.logSegments.stream.allMatch { segment =>
           if (segment.read(minOffset, Integer.MAX_VALUE) == null) {
             false
           } else {
-            segment.read(minOffset, Integer.MAX_VALUE)
-              .records.batches().iterator().asScala.forall(
+            segment.read(minOffset, Integer.MAX_VALUE).records.batches().iterator().asScala.forall(
               expectedLeaderEpoch == _.partitionLeaderEpoch()
             )
           }

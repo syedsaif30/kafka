@@ -49,8 +49,8 @@ class ConsumerGroupServiceTest {
 
     when(admin.describeConsumerGroups(ArgumentMatchers.eq(Collections.singletonList(group)), any()))
       .thenReturn(describeGroupsResult(ConsumerGroupState.STABLE))
-    when(admin.listConsumerGroupOffsets(ArgumentMatchers.eq(group), any()))
-      .thenReturn(listGroupOffsetsResult)
+    when(admin.listConsumerGroupOffsets(ArgumentMatchers.eq(listConsumerGroupOffsetsSpec), any()))
+      .thenReturn(listGroupOffsetsResult(group))
     when(admin.listOffsets(offsetsArgMatcher, any()))
       .thenReturn(listOffsetsResult)
 
@@ -60,7 +60,7 @@ class ConsumerGroupServiceTest {
     assertEquals(topicPartitions.size, assignments.get.size)
 
     verify(admin, times(1)).describeConsumerGroups(ArgumentMatchers.eq(Collections.singletonList(group)), any())
-    verify(admin, times(1)).listConsumerGroupOffsets(ArgumentMatchers.eq(group), any())
+    verify(admin, times(1)).listConsumerGroupOffsets(ArgumentMatchers.eq(listConsumerGroupOffsetsSpec), any())
     verify(admin, times(1)).listOffsets(offsetsArgMatcher, any())
   }
 
@@ -76,8 +76,8 @@ class ConsumerGroupServiceTest {
     val testTopicPartition4 = new TopicPartition("testTopic2", 1);
     val testTopicPartition5 = new TopicPartition("testTopic2", 2);
 
-    // Some topic's partitions gets valid OffsetAndMetada values, other gets nulls values (negative integers) and others aren't defined
-    val commitedOffsets = Map(
+    // Some topic's partitions gets valid OffsetAndMetadata values, other gets nulls values (negative integers) and others aren't defined
+    val committedOffsets = Map(
       testTopicPartition1 -> new OffsetAndMetadata(100),
       testTopicPartition2 -> null,
       testTopicPartition3 -> new OffsetAndMetadata(100),
@@ -112,8 +112,10 @@ class ConsumerGroupServiceTest {
     future.complete(consumerGroupDescription)
     when(admin.describeConsumerGroups(ArgumentMatchers.eq(Collections.singletonList(group)), any()))
       .thenReturn(new DescribeConsumerGroupsResult(Collections.singletonMap(group, future)))
-    when(admin.listConsumerGroupOffsets(ArgumentMatchers.eq(group), any()))
-      .thenReturn(AdminClientTestUtils.listConsumerGroupOffsetsResult(commitedOffsets))
+    when(admin.listConsumerGroupOffsets(ArgumentMatchers.eq(listConsumerGroupOffsetsSpec), any()))
+      .thenReturn(
+        AdminClientTestUtils.listConsumerGroupOffsetsResult(
+          Collections.singletonMap(group, committedOffsets)))
     when(admin.listOffsets(
       ArgumentMatchers.argThat(offsetsArgMatcher(assignedTopicPartitions)),
       any()
@@ -142,7 +144,7 @@ class ConsumerGroupServiceTest {
     assertEquals(expectedOffsets, returnedOffsets)
 
     verify(admin, times(1)).describeConsumerGroups(ArgumentMatchers.eq(Collections.singletonList(group)), any())
-    verify(admin, times(1)).listConsumerGroupOffsets(ArgumentMatchers.eq(group), any())
+    verify(admin, times(1)).listConsumerGroupOffsets(ArgumentMatchers.eq(listConsumerGroupOffsetsSpec), any())
     verify(admin, times(1)).listOffsets(ArgumentMatchers.argThat(offsetsArgMatcher(assignedTopicPartitions)), any())
     verify(admin, times(1)).listOffsets(ArgumentMatchers.argThat(offsetsArgMatcher(unassignedTopicPartitions)), any())
   }
@@ -192,9 +194,9 @@ class ConsumerGroupServiceTest {
     new DescribeConsumerGroupsResult(Collections.singletonMap(group, future))
   }
 
-  private def listGroupOffsetsResult: ListConsumerGroupOffsetsResult = {
+  private def listGroupOffsetsResult(groupId: String): ListConsumerGroupOffsetsResult = {
     val offsets = topicPartitions.map(_ -> new OffsetAndMetadata(100)).toMap.asJava
-    AdminClientTestUtils.listConsumerGroupOffsetsResult(offsets)
+    AdminClientTestUtils.listConsumerGroupOffsetsResult(Map(groupId -> offsets).asJava)
   }
 
   private def offsetsArgMatcher: util.Map[TopicPartition, OffsetSpec] = {
@@ -216,5 +218,9 @@ class ConsumerGroupServiceTest {
       topic -> new TopicDescription(topic, false, partitions.asJava)
     }.toMap
     AdminClientTestUtils.describeTopicsResult(topicDescriptions.asJava)
+  }
+
+  private def listConsumerGroupOffsetsSpec: util.Map[String, ListConsumerGroupOffsetsSpec] = {
+    Collections.singletonMap(group, new ListConsumerGroupOffsetsSpec())
   }
 }

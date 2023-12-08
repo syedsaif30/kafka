@@ -27,7 +27,7 @@ import kafka.controller.{ControllerChannelManager, ControllerContext, StateChang
 import kafka.integration.KafkaServerTestHarness
 import kafka.log.LogManager
 import kafka.zookeeper.ZooKeeperClientTimeoutException
-import org.apache.kafka.clients.consumer.KafkaConsumer
+import org.apache.kafka.clients.consumer.Consumer
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
 import org.apache.kafka.common.Uuid
 import org.apache.kafka.common.metrics.Metrics
@@ -38,7 +38,7 @@ import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.common.serialization.{IntegerDeserializer, IntegerSerializer, StringDeserializer, StringSerializer}
 import org.apache.kafka.common.utils.Time
 import org.apache.kafka.metadata.BrokerState
-import org.junit.jupiter.api.{BeforeEach, Disabled, Test, TestInfo, Timeout}
+import org.junit.jupiter.api.{BeforeEach, Disabled, TestInfo, Timeout}
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.function.Executable
 import org.junit.jupiter.params.ParameterizedTest
@@ -93,7 +93,7 @@ class ServerShutdownTest extends KafkaServerTestHarness {
         valueSerializer = new StringSerializer
       )
 
-    def createConsumer(): KafkaConsumer[Integer, String] =
+    def createConsumer(): Consumer[Integer, String] =
       TestUtils.createConsumer(
         bootstrapServers(),
         securityProtocol = SecurityProtocol.PLAINTEXT,
@@ -251,9 +251,11 @@ class ServerShutdownTest extends KafkaServerTestHarness {
   }
 
   // Verify that if controller is in the midst of processing a request, shutdown completes
-  // without waiting for request timeout.
-  @Test
-  def testControllerShutdownDuringSend(): Unit = {
+  // without waiting for request timeout. Since this involves LeaderAndIsr request, it is
+  // ZK-only for now.
+  @ParameterizedTest(name = TestInfoUtils.TestWithParameterizedQuorumName)
+  @ValueSource(strings = Array("zk"))
+  def testControllerShutdownDuringSend(quorum: String): Unit = {
     val securityProtocol = SecurityProtocol.PLAINTEXT
     val listenerName = ListenerName.forSecurityProtocol(securityProtocol)
 
@@ -278,9 +280,13 @@ class ServerShutdownTest extends KafkaServerTestHarness {
       val controllerConfig = KafkaConfig.fromProps(TestUtils.createBrokerConfig(controllerId, zkConnect))
       val controllerContext = new ControllerContext
       controllerContext.setLiveBrokers(brokerAndEpochs)
-      controllerChannelManager = new ControllerChannelManager(controllerContext, controllerConfig, Time.SYSTEM,
-        metrics, new StateChangeLogger(controllerId, inControllerContext = true, None))
-      controllerChannelManager.startup()
+      controllerChannelManager = new ControllerChannelManager(
+        () => controllerContext.epoch,
+        controllerConfig,
+        Time.SYSTEM,
+        metrics,
+        new StateChangeLogger(controllerId, inControllerContext = true, None))
+      controllerChannelManager.startup(controllerContext.liveOrShuttingDownBrokers)
 
       // Initiate a sendRequest and wait until connection is established and one byte is received by the peer
       val requestBuilder = new LeaderAndIsrRequest.Builder(ApiKeys.LEADER_AND_ISR.latestVersion,

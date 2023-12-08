@@ -69,9 +69,9 @@ class NamedCache {
             storeName
         );
         totalCacheSizeSensor = TaskMetrics.totalCacheSizeBytesSensor(
-            Thread.currentThread().getName(),
-            taskName,
-            streamsMetrics
+                Thread.currentThread().getName(),
+                taskName,
+                streamsMetrics
         );
     }
 
@@ -359,6 +359,13 @@ class NamedCache {
         dirtyKeys.clear();
         cache.clear();
         streamsMetrics.removeAllCacheLevelSensors(Thread.currentThread().getName(), taskName, storeName);
+    }
+
+    synchronized void clear() {
+        head = tail = null;
+        currentSizeBytes = 0;
+        dirtyKeys.clear();
+        cache.clear();
     }
 
     /**

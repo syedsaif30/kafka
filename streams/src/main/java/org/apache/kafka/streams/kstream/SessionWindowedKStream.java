@@ -39,7 +39,7 @@ import java.time.Duration;
  * materialized view) that can be queried using the name provided in the {@link Materialized} instance.
  * Furthermore, updates to the store are sent downstream into a windowed {@link KTable} changelog stream, where
  * "windowed" implies that the {@link KTable} key is a combined key of the original record key and a window ID.
- * New events are added to sessions until their grace period ends (see {@link SessionWindows#grace(Duration)}).
+ * New events are added to sessions until their grace period ends (see {@link SessionWindows#ofInactivityGapAndGrace(Duration, Duration)}).
  * <p>
  * A {@code SessionWindowedKStream} must be obtained from a {@link KGroupedStream} via
  * {@link KGroupedStream#windowedBy(SessionWindows)}.
@@ -134,9 +134,10 @@ public interface SessionWindowedKStream<K, V> {
      * <pre>{@code
      * KafkaStreams streams = ... // compute sum
      * Sting queryableStoreName = ... // the queryableStoreName should be the name of the store as defined by the Materialized instance
-     * ReadOnlySessionStore<String,Long> localWindowStore = streams.store(queryableStoreName, QueryableStoreTypes.<String, Long>ReadOnlySessionStore<String, Long>);
+     * StoreQueryParameters<ReadOnlySessionStore<String, Long>> storeQueryParams = StoreQueryParameters.fromNameAndType(queryableStoreName, QueryableStoreTypes.sessionStore());
+     * ReadOnlySessionStore<String,Long> sessionStore = streams.store(storeQueryParams);
      * String key = "some-key";
-     * KeyValueIterator<Windowed<String>, Long> sumForKeyForWindows = localWindowStore.fetch(key); // key must be local (application state is shared over all running Kafka Streams instances)
+     * KeyValueIterator<Windowed<String>, Long> sumForKeyForWindows = sessionStore.fetch(key); // key must be local (application state is shared over all running Kafka Streams instances)
      * }</pre>
      * For non-local keys, a custom RPC mechanism must be implemented using {@link KafkaStreams#metadataForAllStreamsClients()} to
      * query the value of the key on a parallel running instance of your Kafka Streams application.
@@ -180,9 +181,10 @@ public interface SessionWindowedKStream<K, V> {
      * <pre>{@code
      * KafkaStreams streams = ... // compute sum
      * Sting queryableStoreName = ... // the queryableStoreName should be the name of the store as defined by the Materialized instance
-     * ReadOnlySessionStore<String,Long> localWindowStore = streams.store(queryableStoreName, QueryableStoreTypes.<String, Long>ReadOnlySessionStore<String, Long>);
+     * StoreQueryParameters<ReadOnlySessionStore<String, Long>> storeQueryParams = StoreQueryParameters.fromNameAndType(queryableStoreName, QueryableStoreTypes.sessionStore());
+     * ReadOnlySessionStore<String,Long> sessionStore = streams.store(storeQueryParams);
      * String key = "some-key";
-     * KeyValueIterator<Windowed<String>, Long> sumForKeyForWindows = localWindowStore.fetch(key); // key must be local (application state is shared over all running Kafka Streams instances)
+     * KeyValueIterator<Windowed<String>, Long> sumForKeyForWindows = sessionStore.fetch(key); // key must be local (application state is shared over all running Kafka Streams instances)
      * }</pre>
      * For non-local keys, a custom RPC mechanism must be implemented using {@link KafkaStreams#metadataForAllStreamsClients()} to
      * query the value of the key on a parallel running instance of your Kafka Streams application.
@@ -338,9 +340,10 @@ public interface SessionWindowedKStream<K, V> {
      * <pre>{@code
      * KafkaStreams streams = ... // some windowed aggregation on value type double
      * Sting queryableStoreName = ... // the queryableStoreName should be the name of the store as defined by the Materialized instance
-     * ReadOnlySessionStore<String, Long> sessionStore = streams.store(queryableStoreName, QueryableStoreTypes.<String, Long>sessionStore());
+     * StoreQueryParameters<ReadOnlySessionStore<String, Long>> storeQueryParams = StoreQueryParameters.fromNameAndType(queryableStoreName, QueryableStoreTypes.sessionStore());
+     * ReadOnlySessionStore<String,Long> sessionStore = streams.store(storeQueryParams);
      * String key = "some-key";
-     * KeyValueIterator<Windowed<String>, Long> aggForKeyForSession = localWindowStore.fetch(key); // key must be local (application state is shared over all running Kafka Streams instances)
+     * KeyValueIterator<Windowed<String>, Long> aggForKeyForSession = sessionStore.fetch(key); // key must be local (application state is shared over all running Kafka Streams instances)
      * }</pre>
      * For non-local keys, a custom RPC mechanism must be implemented using {@link KafkaStreams#metadataForAllStreamsClients()} to
      * query the value of the key on a parallel running instance of your Kafka Streams application.
@@ -399,9 +402,10 @@ public interface SessionWindowedKStream<K, V> {
      * <pre>{@code
      * KafkaStreams streams = ... // some windowed aggregation on value type double
      * Sting queryableStoreName = ... // the queryableStoreName should be the name of the store as defined by the Materialized instance
-     * ReadOnlySessionStore<String, Long> sessionStore = streams.store(queryableStoreName, QueryableStoreTypes.<String, Long>sessionStore());
+     * StoreQueryParameters<ReadOnlySessionStore<String, Long>> storeQueryParams = StoreQueryParameters.fromNameAndType(queryableStoreName, QueryableStoreTypes.sessionStore());
+     * ReadOnlySessionStore<String,Long> sessionStore = streams.store(storeQueryParams);
      * String key = "some-key";
-     * KeyValueIterator<Windowed<String>, Long> aggForKeyForSession = localWindowStore.fetch(key); // key must be local (application state is shared over all running Kafka Streams instances)
+     * KeyValueIterator<Windowed<String>, Long> aggForKeyForSession = sessionStore.fetch(key); // key must be local (application state is shared over all running Kafka Streams instances)
      * }</pre>
      * For non-local keys, a custom RPC mechanism must be implemented using {@link KafkaStreams#metadataForAllStreamsClients()} to
      * query the value of the key on a parallel running instance of your Kafka Streams application.
@@ -557,9 +561,10 @@ public interface SessionWindowedKStream<K, V> {
      * <pre>{@code
      * KafkaStreams streams = ... // compute sum
      * Sting queryableStoreName = ... // the queryableStoreName should be the name of the store as defined by the Materialized instance
-     * ReadOnlySessionStore<String,Long> localWindowStore = streams.store(queryableStoreName, QueryableStoreTypes.<String, Long>ReadOnlySessionStore<String, Long>);
+     * StoreQueryParameters<ReadOnlySessionStore<String, Long>> storeQueryParams = StoreQueryParameters.fromNameAndType(queryableStoreName, QueryableStoreTypes.sessionStore());
+     * ReadOnlySessionStore<String,Long> sessionStore = streams.store(storeQueryParams);
      * String key = "some-key";
-     * KeyValueIterator<Windowed<String>, Long> sumForKeyForWindows = localWindowStore.fetch(key); // key must be local (application state is shared over all running Kafka Streams instances)
+     * KeyValueIterator<Windowed<String>, Long> sumForKeyForWindows = sessionStore.fetch(key); // key must be local (application state is shared over all running Kafka Streams instances)
      * }</pre>
      * For non-local keys, a custom RPC mechanism must be implemented using {@link KafkaStreams#metadataForAllStreamsClients()} to
      * query the value of the key on a parallel running instance of your Kafka Streams application.
@@ -617,9 +622,10 @@ public interface SessionWindowedKStream<K, V> {
      * <pre>{@code
      * KafkaStreams streams = ... // compute sum
      * Sting queryableStoreName = ... // the queryableStoreName should be the name of the store as defined by the Materialized instance
-     * ReadOnlySessionStore<String,Long> localWindowStore = streams.store(queryableStoreName, QueryableStoreTypes.<String, Long>ReadOnlySessionStore<String, Long>);
+     * StoreQueryParameters<ReadOnlySessionStore<String, Long>> storeQueryParams = StoreQueryParameters.fromNameAndType(QueryableStoreTypes.sessionStore());
+     * ReadOnlySessionStore<String,Long> sessionStore = streams.store(storeQueryParams);
      * String key = "some-key";
-     * KeyValueIterator<Windowed<String>, Long> sumForKeyForWindows = localWindowStore.fetch(key); // key must be local (application state is shared over all running Kafka Streams instances)
+     * KeyValueIterator<Windowed<String>, Long> sumForKeyForWindows = sessionStore.fetch(key); // key must be local (application state is shared over all running Kafka Streams instances)
      * }</pre>
      * For non-local keys, a custom RPC mechanism must be implemented using {@link KafkaStreams#metadataForAllStreamsClients()} to
      * query the value of the key on a parallel running instance of your Kafka Streams application.
@@ -643,4 +649,18 @@ public interface SessionWindowedKStream<K, V> {
     KTable<Windowed<K>, V> reduce(final Reducer<V> reducer,
                                   final Named named,
                                   final Materialized<K, V, SessionStore<Bytes, byte[]>> materialized);
+
+    /**
+     * Configure when the aggregated result will be emitted for {@code SessionWindowedKStream}.
+     * <p>
+     * For example, for {@link EmitStrategy#onWindowClose} strategy, the aggregated result for a
+     * window will only be emitted when the window closes. For {@link EmitStrategy#onWindowUpdate()}
+     * strategy, the aggregated result for a window will be emitted whenever there is an update to
+     * the window. Note that whether the result will be available in downstream also depends on
+     * cache policy.
+     *
+     * @param emitStrategy {@link EmitStrategy} to configure when the aggregated result for a window will be emitted.
+     * @return a {@code SessionWindowedKStream} with {@link EmitStrategy} configured.
+     */
+    SessionWindowedKStream<K, V> emitStrategy(final EmitStrategy emitStrategy);
 }

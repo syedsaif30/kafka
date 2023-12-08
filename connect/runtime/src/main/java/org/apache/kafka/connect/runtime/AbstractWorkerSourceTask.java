@@ -36,8 +36,11 @@ import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.header.Header;
 import org.apache.kafka.connect.header.Headers;
+import org.apache.kafka.connect.runtime.errors.ErrorHandlingMetrics;
+import org.apache.kafka.connect.runtime.errors.ErrorReporter;
 import org.apache.kafka.connect.runtime.errors.RetryWithToleranceOperator;
 import org.apache.kafka.connect.runtime.errors.Stage;
+import org.apache.kafka.connect.runtime.errors.ToleranceType;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.apache.kafka.connect.source.SourceTask;
 import org.apache.kafka.connect.source.SourceTaskContext;
@@ -58,15 +61,18 @@ import org.slf4j.LoggerFactory;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 import static org.apache.kafka.connect.runtime.WorkerConfig.TOPIC_TRACKING_ENABLE_CONFIG;
 
 /**
- * WorkerTask that contains shared logic for running source tasks with either standard or exactly-once delivery guarantees.
+ * WorkerTask that contains shared logic for running source tasks with either standard semantics
+ * (i.e., either at-least-once or at-most-once) or exactly-once semantics.
  */
 public abstract class AbstractWorkerSourceTask extends WorkerTask {
     private static final Logger log = LoggerFactory.getLogger(AbstractWorkerSourceTask.class);
@@ -191,11 +197,13 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
     private final boolean topicTrackingEnabled;
     private final TopicCreation topicCreation;
     private final Executor closeExecutor;
+    private final Supplier<List<ErrorReporter>> errorReportersSupplier;
 
     // Visible for testing
     List<SourceRecord> toSend;
     protected Map<String, String> taskConfig;
     protected boolean started = false;
+    private volatile boolean producerClosed = false;
 
     protected AbstractWorkerSourceTask(ConnectorTaskId id,
                                        SourceTask task,
@@ -214,13 +222,15 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
                                        ConnectorOffsetBackingStore offsetStore,
                                        WorkerConfig workerConfig,
                                        ConnectMetrics connectMetrics,
+                                       ErrorHandlingMetrics errorMetrics,
                                        ClassLoader loader,
                                        Time time,
                                        RetryWithToleranceOperator retryWithToleranceOperator,
                                        StatusBackingStore statusBackingStore,
-                                       Executor closeExecutor) {
+                                       Executor closeExecutor,
+                                       Supplier<List<ErrorReporter>> errorReportersSupplier) {
 
-        super(id, statusListener, initialState, loader, connectMetrics,
+        super(id, statusListener, initialState, loader, connectMetrics, errorMetrics,
                 retryWithToleranceOperator, time, statusBackingStore);
 
         this.workerConfig = workerConfig;
@@ -233,9 +243,10 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
         this.admin = admin;
         this.offsetReader = offsetReader;
         this.offsetWriter = offsetWriter;
-        this.offsetStore = offsetStore;
+        this.offsetStore = Objects.requireNonNull(offsetStore, "offset store cannot be null for source tasks");
         this.closeExecutor = closeExecutor;
         this.sourceTaskContext = sourceTaskContext;
+        this.errorReportersSupplier = errorReportersSupplier;
 
         this.stopRequestedLatch = new CountDownLatch(1);
         this.sourceTaskMetricsGroup = new SourceTaskMetricsGroup(id, connectMetrics);
@@ -255,6 +266,7 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
 
     @Override
     protected void initializeAndStart() {
+        retryWithToleranceOperator.reporters(errorReportersSupplier.get());
         prepareToInitializeTask();
         offsetStore.start();
         // If we try to start the task at all by invoking initialize, then count this as
@@ -311,10 +323,12 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
         Utils.closeQuietly(retryWithToleranceOperator, "retry operator");
         Utils.closeQuietly(offsetReader, "offset reader");
         Utils.closeQuietly(offsetStore::stop, "offset backing store");
+        Utils.closeQuietly(headerConverter, "header converter");
     }
 
     private void closeProducer(Duration duration) {
         if (producer != null) {
+            producerClosed = true;
             Utils.closeQuietly(() -> producer.close(duration), "source task producer");
         }
     }
@@ -345,18 +359,22 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
                         recordPollReturned(toSend.size(), time.milliseconds() - start);
                     }
                 }
-                if (toSend == null)
-                    continue;
-                log.trace("{} About to send {} records to Kafka", this, toSend.size());
-                if (sendRecords()) {
+                if (toSend == null) {
                     batchDispatched();
-                } else {
+                    continue;
+                }
+                log.trace("{} About to send {} records to Kafka", this, toSend.size());
+                if (!sendRecords()) {
                     stopRequestedLatch.await(SEND_FAILED_BACKOFF_MS, TimeUnit.MILLISECONDS);
                 }
             }
         } catch (InterruptedException e) {
             // Ignore and allow to exit.
         } catch (RuntimeException e) {
+            if (isCancelled()) {
+                log.debug("Skipping final offset commit as task has been cancelled");
+                throw e;
+            }
             try {
                 finalOffsetCommit(true);
             } catch (Exception offsetException) {
@@ -385,6 +403,7 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
             if (producerRecord == null || retryWithToleranceOperator.failed()) {
                 counter.skipRecord();
                 recordDropped(preTransformRecord);
+                processed++;
                 continue;
             }
 
@@ -397,9 +416,17 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
                     producerRecord,
                     (recordMetadata, e) -> {
                         if (e != null) {
-                            log.debug("{} failed to send record to {}: ", AbstractWorkerSourceTask.this, topic, e);
+                            if (producerClosed) {
+                                log.trace("{} failed to send record to {}; this is expected as the producer has already been closed", AbstractWorkerSourceTask.this, topic, e);
+                            } else {
+                                log.error("{} failed to send record to {}: ", AbstractWorkerSourceTask.this, topic, e);
+                            }
                             log.trace("{} Failed record: {}", AbstractWorkerSourceTask.this, preTransformRecord);
                             producerSendFailed(false, producerRecord, preTransformRecord, e);
+                            if (retryWithToleranceOperator.getErrorToleranceType() == ToleranceType.ALL) {
+                                counter.skipRecord();
+                                submittedRecord.ifPresent(SubmittedRecords.SubmittedRecord::ack);
+                            }
                         } else {
                             counter.completeRecord();
                             log.trace("{} Wrote record successfully: topic {} partition {} offset {}",
@@ -433,6 +460,7 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
             recordDispatched(preTransformRecord);
         }
         toSend = null;
+        batchDispatched();
         return true;
     }
 
@@ -556,6 +584,8 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
         private final int batchSize;
         private boolean completed = false;
         private int counter;
+        private int skipped; // Keeps track of filtered records
+
         public SourceRecordWriteCounter(int batchSize, SourceTaskMetricsGroup metricsGroup) {
             assert batchSize > 0;
             assert metricsGroup != null;
@@ -564,6 +594,7 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
             this.metricsGroup = metricsGroup;
         }
         public void skipRecord() {
+            skipped += 1;
             if (counter > 0 && --counter == 0) {
                 finishedAllWrites();
             }
@@ -578,7 +609,7 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
         }
         private void finishedAllWrites() {
             if (!completed) {
-                metricsGroup.recordWrite(batchSize - counter);
+                metricsGroup.recordWrite(batchSize - counter, skipped);
                 completed = true;
             }
         }
@@ -630,8 +661,8 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
             sourceRecordActiveCount.record(activeRecordCount);
         }
 
-        void recordWrite(int recordCount) {
-            sourceRecordWrite.record(recordCount);
+        void recordWrite(int recordCount, int skippedCount) {
+            sourceRecordWrite.record(recordCount - skippedCount);
             activeRecordCount -= recordCount;
             activeRecordCount = Math.max(0, activeRecordCount);
             sourceRecordActiveCount.record(activeRecordCount);
